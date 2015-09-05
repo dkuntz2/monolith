@@ -1,29 +1,37 @@
 package protocol
 
 import (
-	"encoding/json"
+	"errors"
 	"github.com/gorilla/websocket"
 	"log"
-	"strconv"
-	"time"
 )
 
 type Hub struct {
 	connections      map[*websocket.Conn]bool
 	globalBroadcasts chan *ProtocolMessage
-	mapper           DataMapper
+	Mapper           DataMapper
+	processors       map[string]HubProcessor
 }
+
+type HubProcessor func(*Hub, *ProtocolMessage) (*ProtocolMessage, error)
 
 func NewHub() *Hub {
 	mapper, err := NewSqliteMapper("test.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	return &Hub{
+	hub := &Hub{
 		connections:      make(map[*websocket.Conn]bool),
 		globalBroadcasts: make(chan *ProtocolMessage),
-		mapper:           mapper,
+		Mapper:           mapper,
+		processors:       make(map[string]HubProcessor),
 	}
+
+	hub.RegisterProcessor("hello", HelloProcessor)
+	hub.RegisterProcessor("get_messages", GetMessagesProcessor)
+	hub.RegisterProcessor("send_message", SendMessageProcessor)
+
+	return hub
 }
 
 func (hub *Hub) Run() {
@@ -42,6 +50,20 @@ func (hub *Hub) Run() {
 	}
 }
 
+func (hub *Hub) RegisterProcessor(message_name string, fn HubProcessor) error {
+	_, exists := hub.processors[message_name]
+	if exists {
+		return errors.New("Processor already exists for message_name")
+	}
+
+	hub.processors[message_name] = fn
+	return nil
+}
+
+func (hub *Hub) GlobalBroadcast(message *ProtocolMessage) {
+	hub.globalBroadcasts <- message
+}
+
 func (hub *Hub) Attach(conn *websocket.Conn) {
 	hub.connections[conn] = true
 	go hub.listen(conn)
@@ -49,58 +71,30 @@ func (hub *Hub) Attach(conn *websocket.Conn) {
 
 func (hub *Hub) listen(conn *websocket.Conn) {
 	for {
-		protoMessage := &ProtocolMessage{}
-		err := conn.ReadJSON(protoMessage)
+		request := &ProtocolMessage{}
+		err := conn.ReadJSON(request)
 		if err != nil {
 			conn.Close()
 			log.Println(err)
 			return
 		}
 
-		response := ProtocolMessage{}
-		switch protoMessage.Type {
-		case "hello":
-			id, err := hub.mapper.SaveUser(&User{Name: protoMessage.Text})
+		fn, exists := hub.processors[request.Type]
+		var response *ProtocolMessage
+		if exists {
+			response, err = fn(hub, request)
 			if err != nil {
-				response.Type = "error"
-				response.Text = err.Error()
-			} else {
-				response.Type = "new_user"
-				response.Text = strconv.Itoa(int(id))
-			}
-		case "get_messages":
-			messages, err := hub.mapper.GetMessages()
-			if err != nil {
-				response.Type = "error"
-				response.Text = err.Error()
-			} else {
-				messagesString, err := json.Marshal(messages)
-				if err != nil {
-					response.Type = "error"
-					response.Text = err.Error()
-				} else {
-					response.Type = "messages"
-					response.Text = string(messagesString)
+				response = &ProtocolMessage{
+					Type: "error",
+					Text: err.Error(),
 				}
 			}
-		case "send_message":
-			id, err := hub.mapper.SaveMessage(&Message{AuthorId: protoMessage.Id, Payload: protoMessage.Text})
-			if err != nil {
-				response.Type = "error"
-				response.Text = err.Error()
-			} else {
-				response.Type = "new_message"
-				response.Text = strconv.Itoa(int(id))
-
-				hub.globalBroadcasts <- &ProtocolMessage{
-					Type: "message_broadcast",
-					Id:   protoMessage.Id,
-					Text: protoMessage.Text,
-				}
+		} else {
+			response = &ProtocolMessage{
+				Type: "error",
+				Text: "unknown method",
 			}
 		}
-
-		response.Date = time.Now()
 
 		err = conn.WriteJSON(response)
 		if err != nil {
